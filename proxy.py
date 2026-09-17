@@ -23,7 +23,6 @@ urllib3.disable_warnings()
 
 BASE_PATH = os.path.expanduser("~/.hermes/workspace/mcloud2api")
 TOKEN_FILE = os.path.join(BASE_PATH, "token.json")
-WS_URL_FILE = os.path.join(BASE_PATH, "ws_url.txt")
 
 MODELS = {
     "blian_qwen37_plus": {"name": "通义qwen3.7-plus"},
@@ -127,15 +126,22 @@ class TokenManager:
             print(f"Token refresh error: {e}")
             return False
 
+    def ensure_valid(self):
+        if self.load():
+            self.save()
+        if self.is_expired():
+            return self.refresh()
+        return True
+
 
 class WSClient:
     """WebSocket 聊天客户端"""
-    
+
     def __init__(self, token_mgr):
         self.token_mgr = token_mgr
         self.ws_url = None
         self.lock = Lock()
-    
+
     def get_headers(self):
         auth = self.token_mgr.get_basic_auth()
         return {
@@ -150,43 +156,31 @@ class WSClient:
             "x-yun-client-info": "4||30|||||||1920/1080|zh-CN|||",
             "Authorization": auth,
         }
-    
+
     def get_ws_url(self):
-        """获取 WS URL"""
         try:
-            req = self._post("/api/openclaw/get", {
-                "sourceChannel": "522004",
-                "userId": "1039848553440938503",
-                "openclawId": "1305853487463928055"
-            })
-            ws_url = req.get("data", {}).get("wsUrl")
-            return ws_url
+            resp = requests.post(
+                "https://ai.yun.139.com/api/openclaw/get",
+                json={"sourceChannel": "522004", "userId": "1039848553440938503", "openclawId": "1305853487463928055"},
+                headers=self.get_headers(),
+                verify=False, timeout=30,
+            ).json()
+            return resp.get("data", {}).get("wsUrl")
         except Exception as e:
             print(f"Failed to get WS URL: {e}")
             return None
-    
-    def _post(self, path, body):
-        resp = requests.post(
-            f"https://ai.yun.139.com{path}",
-            json=body,
-            headers=self.get_headers(),
-            verify=False,
-            timeout=30,
-        )
-        return resp.json()
-    
+
     async def ws_chat(self, message):
-        """通过 WebSocket 发送聊天消息"""
         import websockets
-        
+
         ws_url = self.get_ws_url()
         if not ws_url:
             return {"error": "Failed to get WS URL"}
-        
+
         ssl_ctx = ssl.create_default_context()
         ssl_ctx.check_hostname = False
         ssl_ctx.verify_mode = ssl.CERT_NONE
-        
+
         try:
             async with websockets.connect(
                 ws_url, max_size=10*1024*1024, ssl=ssl_ctx,
@@ -195,9 +189,8 @@ class WSClient:
                     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
                 }
             ) as ws:
-                # 等待 hello-ok
                 await asyncio.wait_for(ws.recv(), timeout=5)
-                
+
                 # 发送消息 (JSON-RPC 格式)
                 msg = {
                     "id": str(uuid.uuid4()),
@@ -206,32 +199,30 @@ class WSClient:
                     "params": {"message": message}
                 }
                 await ws.send(json.dumps(msg))
-                
-                # 收集响应
+
                 answer = ""
                 try:
                     while True:
                         resp = await asyncio.wait_for(ws.recv(), timeout=60)
                         d = json.loads(resp)
-                        
+
                         if d.get("type") == "event" and d.get("event") == "agent":
                             payload = d.get("payload", {})
                             if payload.get("stream") == "assistant":
                                 text = payload.get("data", {}).get("text")
                                 if text:
-                                    answer = text  # 取最新完整文本
+                                    answer = text
                             elif payload.get("stream") == "lifecycle":
                                 if payload.get("data", {}).get("phase") == "end":
                                     break
                 except asyncio.TimeoutError:
                     pass
-                
+
                 return {"answer": answer}
         except Exception as e:
             return {"error": str(e)}
-    
+
     def chat(self, message):
-        """同步调用"""
         loop = asyncio.new_event_loop()
         result = loop.run_until_complete(self.ws_chat(message))
         loop.close()
@@ -268,39 +259,7 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             return json.loads(self.rfile.read(length))
         return {}
 
-    def do_GET(self):
-        parsed = urlparse(self.path)
-        if parsed.path == "/v1/models":
-            self.list_models()
-        elif parsed.path == "/health":
-            self.send_json({"status": "ok", "service": "mcloud2api"})
-        elif parsed.path == "/":
-            self.send_json({
-                "service": "mcloud2api",
-                "version": "1.0",
-                "endpoints": ["/", "/health", "/v1/models", "/v1/chat/completions", "/auth/set"],
-            })
-        else:
-            self.send_json({"error": {"message": "Not found", "type": "not_found"}}, 404)
-
-    def do_POST(self):
-        try:
-            parsed = urlparse(self.path)
-            if parsed.path == "/v1/chat/completions":
-                self.chat_completion()
-            elif parsed.path == "/auth/set":
-                self.set_auth()
-            else:
-                self.send_json({"error": {"message": "Not found", "type": "not_found"}}, 404)
-        except BrokenPipeError:
-            pass
-        except Exception as e:
-            print(f"Error handling POST {self.path}: {e}")
-            traceback.print_exc()
-            try:
-                self.send_json({"error": {"message": str(e), "type": "server_error"}}, 500)
-            except:
-                pass
+    # ==================== 路由 ====================
 
     def do_GET(self):
         try:
@@ -315,13 +274,42 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                     "version": "1.0",
                     "endpoints": ["/", "/health", "/v1/models", "/v1/chat/completions", "/auth/set"],
                 })
+            # Ollama 兼容端点
+            elif parsed.path == "/api/tags":
+                self.ollama_tags()
             else:
                 self.send_json({"error": {"message": "Not found", "type": "not_found"}}, 404)
         except BrokenPipeError:
             pass
         except Exception as e:
-            print(f"Error handling GET {self.path}: {e}")
+            print(f"Error GET {self.path}: {e}")
             traceback.print_exc()
+
+    def do_POST(self):
+        try:
+            parsed = urlparse(self.path)
+            if parsed.path == "/v1/chat/completions":
+                self.chat_completion()
+            elif parsed.path == "/auth/set":
+                self.set_auth()
+            # Ollama 兼容端点
+            elif parsed.path == "/api/show":
+                self.ollama_show()
+            elif parsed.path == "/api/chat":
+                self.ollama_chat()
+            elif parsed.path == "/api/generate":
+                self.ollama_generate()
+            else:
+                self.send_json({"error": {"message": "Not found", "type": "not_found"}}, 404)
+        except BrokenPipeError:
+            pass
+        except Exception as e:
+            print(f"Error POST {self.path}: {e}")
+            traceback.print_exc()
+            try:
+                self.send_json({"error": {"message": str(e), "type": "server_error"}}, 500)
+            except:
+                pass
 
     def do_OPTIONS(self):
         try:
@@ -333,6 +321,23 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             self.end_headers()
         except:
             pass
+
+    # ==================== OpenAI API ====================
+
+    def _get_headers(self):
+        auth = self.token_mgr.get_basic_auth()
+        return {
+            "Host": "ai.yun.139.com",
+            "Accept": "application/json, text/plain, */*",
+            "Content-Type": "application/json;charset=UTF-8",
+            "Origin": "https://appmail.mail.10086.cn",
+            "Referer": "https://appmail.mail.10086.cn/",
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) mcloud/8.7.2 Chrome/108.0.5359.215 Electron/22.3.0 Safari/537.36",
+            "x-yun-api-version": "v1",
+            "x-yun-app-channel": "522004",
+            "x-yun-client-info": "4||30|||||||1920/1080|zh-CN|||",
+            "Authorization": auth,
+        }
 
     def set_auth(self):
         body = self.read_body()
@@ -373,37 +378,18 @@ class OpenAIHandler(BaseHTTPRequestHandler):
 
         self.send_json({"object": "list", "data": models})
 
-    def _get_headers(self):
-        auth = self.token_mgr.get_basic_auth()
-        return {
-            "Host": "ai.yun.139.com",
-            "Accept": "application/json, text/plain, */*",
-            "Content-Type": "application/json;charset=UTF-8",
-            "Origin": "https://appmail.mail.10086.cn",
-            "Referer": "https://appmail.mail.10086.cn/",
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) mcloud/8.7.2 Chrome/108.0.5359.215 Electron/22.3.0 Safari/537.36",
-            "x-yun-api-version": "v1",
-            "x-yun-app-channel": "522004",
-            "x-yun-client-info": "4||30|||||||1920/1080|zh-CN|||",
-            "Authorization": auth,
-        }
-
     def chat_completion(self):
         body = self.read_body()
         openai_model = body.get("model", "gpt-4")
         messages = body.get("messages", [])
         stream = body.get("stream", False)
 
-        # 提取用户消息
         user_msg = ""
         for msg in reversed(messages):
             if msg.get("role") == "user":
                 user_msg = msg.get("content", "")
                 break
 
-        mclaw_model = OPENAI_TO_MCLAW.get(openai_model, "blian_qwen37_plus")
-
-        # 通过 WS 发送聊天
         result = self.ws_client.chat(user_msg)
 
         if "error" in result:
@@ -429,6 +415,99 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             },
         }
         self.send_json(response)
+
+    # ==================== Ollama 兼容 API ====================
+
+    def ollama_tags(self):
+        """Ollama /api/tags 兼容端点"""
+        models = []
+        for code, info in MODELS.items():
+            openai_name = MCLAW_TO_OPENAI.get(code, code)
+            models.append({
+                "name": openai_name,
+                "model": openai_name,
+                "size": 0,
+                "digest": "",
+                "details": {
+                    "parent_model": "",
+                    "format": "gguf",
+                    "family": code,
+                    "families": [code],
+                    "parameter_size": "7B",
+                    "quantization_level": "Q4_0"
+                }
+            })
+        self.send_json({"models": models})
+
+    def ollama_show(self):
+        """Ollama /api/show 兼容端点"""
+        length = int(self.headers.get("Content-Length", 0))
+        if length > 0:
+            body = json.loads(self.rfile.read(length))
+        else:
+            body = {}
+        model_name = body.get("name", "gpt-4")
+        mclaw_code = OPENAI_TO_MCLAW.get(model_name, "blian_qwen37_plus")
+        self.send_json({
+            "modelfile": "",
+            "parameters": "",
+            "template": "",
+            "details": {
+                "parent_model": "",
+                "format": "gguf",
+                "family": mclaw_code,
+                "families": [mclaw_code],
+                "parameter_size": "7B",
+                "quantization_level": "Q4_0"
+            },
+            "model_info": {}
+        })
+
+    def ollama_chat(self):
+        """Ollama /api/chat 兼容端点"""
+        body = self.read_body()
+        model_name = body.get("model", "gpt-4")
+        messages = body.get("messages", [])
+
+        user_msg = ""
+        for msg in reversed(messages):
+            if msg.get("role") == "user":
+                user_msg = msg.get("content", "")
+                break
+
+        result = self.ws_client.chat(user_msg)
+
+        if "error" in result:
+            self.send_json({"error": result["error"]}, 500)
+            return
+
+        answer = result.get("answer", "")
+        self.send_json({
+            "model": model_name,
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+            "message": {"role": "assistant", "content": answer},
+            "done": True
+        })
+
+    def ollama_generate(self):
+        """Ollama /api/generate 兼容端点"""
+        body = self.read_body()
+        model_name = body.get("model", "gpt-4")
+        prompt = body.get("prompt", "")
+
+        result = self.ws_client.chat(prompt)
+
+        if "error" in result:
+            self.send_json({"error": result["error"]}, 500)
+            return
+
+        answer = result.get("answer", "")
+        self.send_json({
+            "model": model_name,
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+            "response": answer,
+            "done": True
+        })
 
 
 def main():
