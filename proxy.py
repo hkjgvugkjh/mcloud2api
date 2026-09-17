@@ -12,10 +12,12 @@ import sys
 import base64
 import urllib3
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
 from urllib.parse import urlparse, parse_qs
-from threading import Lock
+from threading import Lock, Thread
 import asyncio
 import ssl
+import traceback
 
 urllib3.disable_warnings()
 
@@ -236,13 +238,19 @@ class WSClient:
         return result
 
 
+class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+    """支持多线程的 HTTP 服务器"""
+    daemon_threads = True
+    allow_reuse_address = True
+
+
 class OpenAIHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     token_mgr = None
     ws_client = None
 
     def log_message(self, format, *args):
-        print(f"[{time.strftime('%H:%M:%S')}] {format % args}")
+        print(f"[{time.strftime('%H:%M:%S')}] {format % args}", flush=True)
 
     def send_json(self, obj, status=200):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -276,21 +284,55 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             self.send_json({"error": {"message": "Not found", "type": "not_found"}}, 404)
 
     def do_POST(self):
-        parsed = urlparse(self.path)
-        if parsed.path == "/v1/chat/completions":
-            self.chat_completion()
-        elif parsed.path == "/auth/set":
-            self.set_auth()
-        else:
-            self.send_json({"error": {"message": "Not found", "type": "not_found"}}, 404)
+        try:
+            parsed = urlparse(self.path)
+            if parsed.path == "/v1/chat/completions":
+                self.chat_completion()
+            elif parsed.path == "/auth/set":
+                self.set_auth()
+            else:
+                self.send_json({"error": {"message": "Not found", "type": "not_found"}}, 404)
+        except BrokenPipeError:
+            pass
+        except Exception as e:
+            print(f"Error handling POST {self.path}: {e}")
+            traceback.print_exc()
+            try:
+                self.send_json({"error": {"message": str(e), "type": "server_error"}}, 500)
+            except:
+                pass
+
+    def do_GET(self):
+        try:
+            parsed = urlparse(self.path)
+            if parsed.path == "/v1/models":
+                self.list_models()
+            elif parsed.path == "/health":
+                self.send_json({"status": "ok", "service": "mcloud2api"})
+            elif parsed.path == "/":
+                self.send_json({
+                    "service": "mcloud2api",
+                    "version": "1.0",
+                    "endpoints": ["/", "/health", "/v1/models", "/v1/chat/completions", "/auth/set"],
+                })
+            else:
+                self.send_json({"error": {"message": "Not found", "type": "not_found"}}, 404)
+        except BrokenPipeError:
+            pass
+        except Exception as e:
+            print(f"Error handling GET {self.path}: {e}")
+            traceback.print_exc()
 
     def do_OPTIONS(self):
-        self.send_response(200)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "*")
-        self.send_header("Access-Control-Allow-Headers", "*")
-        self.send_header("Access-Control-Max-Age", "3600")
-        self.end_headers()
+        try:
+            self.send_response(200)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "*")
+            self.send_header("Access-Control-Allow-Headers", "*")
+            self.send_header("Access-Control-Max-Age", "3600")
+            self.end_headers()
+        except:
+            pass
 
     def set_auth(self):
         body = self.read_body()
@@ -392,7 +434,7 @@ class OpenAIHandler(BaseHTTPRequestHandler):
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="mcloud2api")
-    parser.add_argument("-p", "--port", type=int, default=13080)
+    parser.add_argument("-p", "--port", type=int, default=28943)
     parser.add_argument("-H", "--host", default="0.0.0.0")
     parser.add_argument("--phone", default="")
     parser.add_argument("--auth-token", default="")
@@ -410,7 +452,7 @@ def main():
     OpenAIHandler.token_mgr = token_mgr
     OpenAIHandler.ws_client = ws_client
 
-    server = HTTPServer((args.host, args.port), OpenAIHandler)
+    server = ThreadingHTTPServer((args.host, args.port), OpenAIHandler)
     print(f"[mcloud2api] 监听于 http://{args.host}:{args.port}")
     try:
         server.serve_forever()
