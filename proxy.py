@@ -274,7 +274,7 @@ class OpenAIHandler(BaseHTTPRequestHandler):
                     "version": "1.0",
                     "endpoints": ["/", "/health", "/v1/models", "/v1/chat/completions", "/auth/set"],
                 })
-            # Ollama 兼容端点
+            # Ollama 兼容端点 - /api/tags
             elif parsed.path == "/api/tags":
                 self.ollama_tags()
             else:
@@ -288,17 +288,31 @@ class OpenAIHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         try:
             parsed = urlparse(self.path)
+            # 读取请求体用于调试
+            length = int(self.headers.get("Content-Length", 0))
+            body = b""
+            if length > 0:
+                body = self.rfile.read(length)
+                print(f"[DEBUG] POST {self.path} body={body.decode('utf-8', errors='replace')[:500]}", flush=True)
+            
+            body_dict = {}
+            if body:
+                body_dict = json.loads(body.decode('utf-8', errors='replace'))
+            
             if parsed.path == "/v1/chat/completions":
-                self.chat_completion()
+                self.chat_completion(body_dict)
             elif parsed.path == "/auth/set":
                 self.set_auth()
             # Ollama 兼容端点
             elif parsed.path == "/api/show":
-                self.ollama_show()
+                self.ollama_show(body_dict)
             elif parsed.path == "/api/chat":
-                self.ollama_chat()
+                self.ollama_chat(body_dict)
             elif parsed.path == "/api/generate":
-                self.ollama_generate()
+                self.ollama_generate(body_dict)
+            # 有些客户端用 POST /api/tags
+            elif parsed.path == "/api/tags":
+                self.ollama_tags()
             else:
                 self.send_json({"error": {"message": "Not found", "type": "not_found"}}, 404)
         except BrokenPipeError:
@@ -378,8 +392,9 @@ class OpenAIHandler(BaseHTTPRequestHandler):
 
         self.send_json({"object": "list", "data": models})
 
-    def chat_completion(self):
-        body = self.read_body()
+    def chat_completion(self, body=None):
+        if body is None:
+            body = self.read_body()
         openai_model = body.get("model", "gpt-4")
         messages = body.get("messages", [])
         stream = body.get("stream", False)
@@ -439,13 +454,10 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             })
         self.send_json({"models": models})
 
-    def ollama_show(self):
+    def ollama_show(self, body=None):
         """Ollama /api/show 兼容端点"""
-        length = int(self.headers.get("Content-Length", 0))
-        if length > 0:
-            body = json.loads(self.rfile.read(length))
-        else:
-            body = {}
+        if body is None:
+            body = self.read_body()
         model_name = body.get("name", "gpt-4")
         mclaw_code = OPENAI_TO_MCLAW.get(model_name, "blian_qwen37_plus")
         self.send_json({
@@ -463,9 +475,10 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             "model_info": {}
         })
 
-    def ollama_chat(self):
+    def ollama_chat(self, body=None):
         """Ollama /api/chat 兼容端点"""
-        body = self.read_body()
+        if body is None:
+            body = self.read_body()
         model_name = body.get("model", "gpt-4")
         messages = body.get("messages", [])
 
@@ -489,11 +502,14 @@ class OpenAIHandler(BaseHTTPRequestHandler):
             "done": True
         })
 
-    def ollama_generate(self):
+    def ollama_generate(self, body=None):
         """Ollama /api/generate 兼容端点"""
-        body = self.read_body()
-        model_name = body.get("model", "gpt-4")
-        prompt = body.get("prompt", "")
+        if isinstance(body, dict):
+            body_dict = body
+        else:
+            body_dict = self.read_body()
+        model_name = body_dict.get("model", "gpt-4")
+        prompt = body_dict.get("prompt", "")
 
         result = self.ws_client.chat(prompt)
 
