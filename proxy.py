@@ -399,37 +399,93 @@ class OpenAIHandler(BaseHTTPRequestHandler):
         messages = body.get("messages", [])
         stream = body.get("stream", False)
 
+        # 提取用户消息
         user_msg = ""
         for msg in reversed(messages):
             if msg.get("role") == "user":
                 user_msg = msg.get("content", "")
                 break
 
+        mclaw_model = OPENAI_TO_MCLAW.get(openai_model, "blian_qwen37_plus")
+
+        # 通过 WS 发送聊天
         result = self.ws_client.chat(user_msg)
 
         if "error" in result:
-            self.send_json({"error": {"message": result["error"], "type": "server_error"}}, 500)
+            if stream:
+                self._sse_error(result["error"])
+            else:
+                self.send_json({"error": {"message": result["error"], "type": "server_error"}}, 500)
             return
 
         answer = result.get("answer", "[mclaw proxy] 未收到响应")
+        chat_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
 
-        response = {
-            "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
-            "object": "chat.completion",
+        if stream:
+            # SSE 流式响应
+            self._send_streaming_response(chat_id, openai_model, answer)
+        else:
+            # 非流式响应
+            response = {
+                "id": chat_id,
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": openai_model,
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": answer}, "finish_reason": "stop"}],
+                "usage": {
+                    "prompt_tokens": len(user_msg) // 4,
+                    "completion_tokens": len(answer) // 4,
+                    "total_tokens": len(user_msg) // 4 + len(answer) // 4
+                },
+            }
+            self.send_json(response)
+
+    def _send_streaming_response(self, chat_id, model, answer):
+        """发送 SSE 流式响应"""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+
+        # 发送 chunk
+        chunk_size = 8
+        for i in range(0, len(answer), chunk_size):
+            chunk = answer[i:i+chunk_size]
+            resp = {
+                "id": chat_id,
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": model,
+                "choices": [{"index": 0, "delta": {"content": chunk}, "finish_reason": None}]
+            }
+            self.wfile.write(f"data: {json.dumps(resp, ensure_ascii=False)}\n\n".encode("utf-8"))
+            self.wfile.flush()
+            time.sleep(0.01)
+
+        # 发送结束 chunk
+        final = {
+            "id": chat_id,
+            "object": "chat.completion.chunk",
             "created": int(time.time()),
-            "model": openai_model,
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": answer},
-                "finish_reason": "stop"
-            }],
-            "usage": {
-                "prompt_tokens": len(user_msg) // 4,
-                "completion_tokens": len(answer) // 4,
-                "total_tokens": len(user_msg) // 4 + len(answer) // 4
-            },
+            "model": model,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
         }
-        self.send_json(response)
+        self.wfile.write(f"data: {json.dumps(final, ensure_ascii=False)}\n\n".encode("utf-8"))
+        self.wfile.write(b"data: [DONE]\n\n")
+        self.wfile.flush()
+        
+        # 关闭连接
+        self.close_connection = True
+
+    def _sse_error(self, error_msg):
+        """发送 SSE 错误"""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.end_headers()
+        self.wfile.write(f"data: {json.dumps({'error': {'message': error_msg, 'type': 'server_error'}}, ensure_ascii=False)}\n\n".encode("utf-8"))
+        self.wfile.write(b"data: [DONE]\n\n")
+        self.wfile.flush()
 
     # ==================== Ollama 兼容 API ====================
 
