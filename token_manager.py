@@ -126,11 +126,11 @@ class TokenManager:
         try:
             resp = requests.post(
                 f"{BASE_URL}/user/auth/refreshToken",
-                json={"authToken": self.auth_token},
+                json={"token": self.auth_token},
                 headers={
                     "Authorization": auth,
                     "Content-Type": "application/json",
-                    "x-yun-app-channel": "10112",
+                    "x-yun-app-channel": "522004",
                 },
                 verify=False,
                 timeout=30,

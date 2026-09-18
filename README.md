@@ -10,7 +10,7 @@ mcloud2api
 - OpenAI `/v1/chat/completions` 兼容（stream + non-stream）
 - OpenAI `/v1/models` 模型列表查询
 - Ollama `/api/tags`, `/api/show`, `/api/chat`, `/api/generate` 兼容
-- 自动 token 刷新（30天有效期）
+- 自动从 Local Storage 读取/刷新 token
 - 多线程 HTTP 服务器
 - 模型路由（GPT-4 / Claude / DeepSeek / Qwen / Doubao）
 
@@ -20,34 +20,45 @@ mcloud2api
 pip install -r requirements.txt
 ```
 
-依赖：`requests`, `websockets`
+依赖：`requests`, `websockets`, `plyvel`
 
 ## 使用
 
-### 1. 设置认证
+### 方式一：自动从 Local Storage 读取（推荐）
+
+如果你在本地运行过 mcloud 桌面客户端，token 会自动存储在 Local Storage 中。
 
 ```bash
-# 方式一：命令行参数
+# 启动时自动从 Local Storage 读取最新 token
+python3 proxy.py -p 28943
+```
+
+### 方式二：手动指定
+
+```bash
+# 命令行参数
 python3 proxy.py --phone 138xxxx --auth-token <your_token>
 
-# 方式二：API
+# API 设置
 curl -X POST http://localhost:28943/auth/set \
   -H "Content-Type: application/json" \
   -d '{"phone": "138xxxx", "auth_token": "<your_token>"}'
 
-# 方式三：环境变量
+# 环境变量
 export MCLOUD_PHONE=138xxxx
 export MCLOUD_AUTH_TOKEN=<your_token>
 python3 proxy.py
 ```
 
-### 2. 启动代理
+### 方式三：一键启动（含 mitmproxy 拦截）
 
 ```bash
-python3 proxy.py -p 28943
+python3 start.py
 ```
 
-### 3. 调用示例
+启动后 mcloud 会弹出，登录后自动捕获 token。
+
+### 调用示例
 
 ```bash
 # 聊天
@@ -68,6 +79,100 @@ curl -N http://localhost:28943/v1/chat/completions \
     "stream": true
   }'
 ```
+
+## Token 获取详解
+
+### 方式一：从 Local Storage 自动读取（推荐）
+
+mcloud 桌面客户端的 token 存储在 LevelDB 格式的 Local Storage 中。
+
+**位置**：
+```
+~/.config/mcloud/Local Storage/leveldb/
+```
+
+**数据库文件**：
+- `*.ldb` - 数据文件
+- `*.log` - 日志文件
+
+**存储格式**：
+- Key: `_file://\x00\x01UserInfo`
+- Value: `\x01` + JSON
+
+**JSON 结构**：
+```json
+{
+  "account": "138xxxx",
+  "token": "gvS5Mc4y|1|RCS|1792206977965|...",
+  "authToken": "oCjlO6df|1|RCS|1792206918040|...",
+  "userDomainId": "1039848553440938503",
+  "deviceid": "...",
+  ...
+}
+```
+
+**token 格式**：
+```
+gvS5Mc4y|1|RCS|1792206977965|base64signature
+          ^   ^       ^            ^
+        类型  版本   过期时间戳    签名
+```
+
+- 类型: `1` = RCS (Refresh Credential String)
+- 有效期: 30 天 (2592000 秒)
+
+**自动读取流程**：
+1. 启动时 proxy.py 会尝试从 Local Storage 读取
+2. 解析 UserInfo JSON 获取 authToken
+3. 如果 token 即将过期（1小时内），自动调用 refresh 接口刷新
+
+### 方式二：手动提取（脚本）
+
+```bash
+# 使用 Python 读取
+python3 << 'EOF'
+import plyvel, os, json
+
+db_path = os.path.expanduser('~/.config/mcloud/Local Storage/leveldb')
+if os.path.exists(os.path.join(db_path, 'LOCK')):
+    os.remove(os.path.join(db_path, 'LOCK'))
+
+db = plyvel.DB(db_path, create_if_missing=False, error_if_exists=False)
+for key, value in db:
+    key_str = key.decode('utf-8', errors='ignore')
+    if 'UserInfo' in key_str and '_file://' in key_str:
+        val = value.decode('utf-8', errors='ignore').lstrip('\x01')
+        data = json.loads(val)
+        print(f"Phone: {data['account']}")
+        print(f"AuthToken: {data['authToken']}")
+        print(f"Token: {data['token']}")
+        # 计算过期时间
+        parts = data['token'].split('|')
+        if len(parts) >= 4:
+            from datetime import datetime
+            ts = int(parts[3]) / 1000
+            print(f"Expire: {datetime.fromtimestamp(ts)}")
+        break
+db.close()
+EOF
+```
+
+### 方式三：通过 mitmproxy 拦截
+
+运行 `python3 start.py`，然后：
+1. mitmproxy 会启动并监听 8080 端口
+2. mcloud 通过代理启动
+3. 在 mcloud 中完成登录
+4. 按 Ctrl+C 停止捕获
+5. token 自动保存到 `token.json`
+
+### 方式四：从浏览器导出
+
+如果你在网页版登录过：
+1. 打开 `https://yun.139.com`
+2. 开发者工具 → Application → Local Storage
+3. 找到 `UserInfo` key
+4. 复制 `authToken` 字段
 
 ## 模型映射
 
@@ -114,12 +219,6 @@ custom_providers:
     api_mode: chat_completions
     discover_models: true
 ```
-
-## Token 获取
-
-token 存储在中国移动云盘的 Local Storage 中。
-
-获取方式：通过 mitmproxy 拦截 mcloud 应用的网络请求，或从浏览器导出的 Local Storage 中提取。
 
 ## 许可证
 

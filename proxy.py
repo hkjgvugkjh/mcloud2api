@@ -617,8 +617,9 @@ def main():
     if args.phone and args.auth_token:
         token_mgr.set_token(args.phone, args.auth_token)
     else:
-        if not token_mgr.load():
-            print("未找到 token，请使用 --phone 和 --auth-token 设置")
+        if not token_mgr.load_from_leveldb():
+            if not token_mgr.load():
+                print("未找到 token，请使用 --phone 和 --auth-token 设置")
 
     ws_client = WSClient(token_mgr)
 
