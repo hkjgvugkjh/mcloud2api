@@ -161,7 +161,7 @@ class WSClient:
         try:
             resp = requests.post(
                 "https://ai.yun.139.com/api/openclaw/get",
-                json={"sourceChannel": "522004", "userId": "", "openclawId": ""},
+                json={"sourceChannel": "522004", "userId": "1039848553440938503", "openclawId": "1305853487463928055"},
                 headers=self.get_headers(),
                 verify=False, timeout=30,
             ).json()
