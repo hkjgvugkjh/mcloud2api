@@ -60,6 +60,29 @@ class TokenManager:
         self.auth_token = None
         self.expire_time = 0
 
+    def load_from_leveldb(self):
+        """从 mcloud LevelDB 读取 token"""
+        try:
+            import plyvel
+            MCLOUD_DB = os.path.expanduser("~/.config/mcloud/Local Storage/leveldb")
+            if os.path.exists(os.path.join(MCLOUD_DB, 'LOCK')):
+                os.remove(os.path.join(MCLOUD_DB, 'LOCK'))
+            db = plyvel.DB(MCLOUD_DB, create_if_missing=False, error_if_exists=False)
+            for key, value in db:
+                key_str = key.decode('utf-8', errors='ignore')
+                if 'UserInfo' in key_str and '_file://' in key_str:
+                    val_str = value.decode('utf-8', errors='ignore').lstrip('\x01')
+                    data = json.loads(val_str)
+                    self.phone = data.get('account')
+                    self.auth_token = data.get('authToken')
+                    self.token = self.auth_token
+                    db.close()
+                    return True
+            db.close()
+        except Exception as e:
+            pass
+        return False
+
     def load(self):
         if os.path.exists(self.token_file):
             try:
